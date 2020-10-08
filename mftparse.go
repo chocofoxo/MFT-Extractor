@@ -46,7 +46,7 @@ func main() {
 
 	//Extract key data (listed in VBR struct) to determine starting location of MFT on disk
 	vbr.BytesPerSector = vbr.parseData(11, 2)
-	fmt.Printf("Successfully parsed BytesPerSector: %s\n", vbr.BytesPerSector)
+	//fmt.Printf("Successfully parsed BytesPerSector: %s\n", vbr.BytesPerSector)
 
 	//Obtain first MFT record
 	//Extract entire MFT to current directory
