@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"os"
@@ -28,14 +29,22 @@ type MFT struct {
 	startBytes      int
 	bytesPerCluster int
 	selfRecord      []byte
-	sizeLogical     int64
+	sizeLogical     uint64
 	dataRunsAll     []DataRun
+	vbr             *VBR
 }
 
 //DataRun struct stores key information from each data run
 type DataRun struct {
 	numBytes    uint64
 	offsetBytes int64
+}
+
+//MFTLocations stores the starting and ending byte offset for each MFT piece
+type MFTLocations struct {
+	start int64
+	end   int64
+	bytes int
 }
 
 func main() {
@@ -45,7 +54,8 @@ func main() {
 	vbr := VBR{} //Create new VBR struct to store data
 	vbr.parseVBR()
 
-	mft := MFT{} //Create new MFT struct to store data
+	mft := MFT{}   //Create new MFT struct to store data
+	mft.vbr = &vbr //save pointer to corresponding volume
 
 	//Obtain starting offset of MFT
 	mft.bytesPerCluster = vbr.BytesPerSector * vbr.SectorsPerCluster
@@ -58,9 +68,78 @@ func main() {
 	mft.parseMFTDataRuns()
 
 	//Extract rest of MFT using data runs and export as .bin
-	//mft.extractMFT()
+	mft.extractMFT()
 }
 
+func (mft *MFT) extractMFT() {
+
+	//Calculate starting and ending byte offset for each data run
+	//Starting offset : previous data run start + offset
+	//Ending offset: starting offset + length - 1
+
+	mftLocationsAll := make([]MFTLocations, 0) //set up slice to store locations of MFT data on disk
+	var offsetVol int64                        //start offset at beginning of volume
+	var totalSize uint64                       //track total size of mft
+	for _, datarun := range mft.dataRunsAll {
+		mftlocation := MFTLocations{}
+		mftlocation.start = datarun.offsetBytes + offsetVol
+		mftlocation.end = mftlocation.start + int64(datarun.numBytes-1)
+		mftlocation.bytes = int(datarun.numBytes)
+		totalSize += uint64(mftlocation.bytes)
+
+		//ensure that bytes extracted do not exceed size of MFT
+		if totalSize > mft.sizeLogical {
+			break
+		}
+		mftLocationsAll = append(mftLocationsAll, mftlocation)
+		offsetVol = mftlocation.start //move offset to start of data run
+	}
+
+	fmt.Printf("MFT Locations: %+v\n", mftLocationsAll)
+
+	//Get handle on disk volume C
+	pathToC := `\\.\C:`
+	volC, errOpen := os.Open(pathToC)
+	if errOpen != nil {
+		log.Fatalf("Error while opening volume: %s\n", errOpen)
+	}
+
+	//Create/overwrite MFT.bin file and open to append
+	if errOW := ioutil.WriteFile("MFT.bin", []byte(""), 0600); errOW != nil {
+		log.Fatalf("Error occured when overwriting MFT.bin: %s\n", errOW)
+	}
+
+	mftFile, errCreate := os.OpenFile("MFT.bin", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if errCreate != nil {
+		log.Fatalf("Error while creating MFT.bin file: %s\n", errCreate)
+	}
+
+	//Loop through each location of the MFT and write to MFT.bin
+
+	for _, location := range mftLocationsAll {
+
+		//Seek to start of MFT on volume
+		if _, errSeek := volC.Seek(location.start, 0); errSeek != nil {
+			log.Fatalf("Error occured when seeking MFT data: %s\n", errSeek)
+		}
+
+		mftdata := make([]byte, location.bytes) //make temporary byte slice to store data
+
+		//Store MFT data to temporary slice
+		if _, errRead := volC.Read(mftdata); errRead != nil {
+			log.Fatalf("Error occured when reading MFT data: %s\n", errRead)
+		}
+
+		//Write slice to file
+		if _, errWrite := mftFile.Write(mftdata); errWrite != nil {
+			log.Fatalf("Error occured when writing MFT data: %s\n", errWrite)
+		}
+	}
+	//Close file
+	mftFile.Close()
+	//Close volume
+	volC.Close()
+}
 func (mft *MFT) parseMFTDataRuns() {
 
 	//Get handle on disk volume C
@@ -116,11 +195,13 @@ func (mft *MFT) parseMFTDataRuns() {
 	}
 
 	//Parse Data Attribute of MFT Self-Record to obtain size and data runs
-	offsetRuns := int64(binary.LittleEndian.Uint16(mft.readBytes(offsetDataAttr+32, 2)))     //Offset to Data Runs in int64
-	mft.sizeLogical = int64(binary.LittleEndian.Uint64(mft.readBytes(offsetDataAttr+48, 8))) //Logical size of MFT
+	offsetRuns := int64(binary.LittleEndian.Uint16(mft.readBytes(offsetDataAttr+32, 2))) //Offset to Data Runs in int64
+	mft.sizeLogical = binary.LittleEndian.Uint64(mft.readBytes(offsetDataAttr+48, 8))    //Logical size of MFT
 
 	//Extract Data Runs
 	dataRunsRaw := mft.readBytes(offsetRuns+offsetDataAttr, int(sizeAttr-offsetRuns)) //read from start of data runs to end of data attribute
+
+	fmt.Printf("Data Runs: %x\n", dataRunsRaw)
 
 	//Set up slice of DataRun structs to parse data into
 	mft.dataRunsAll = make([]DataRun, 0)
@@ -174,7 +255,7 @@ func (mft *MFT) parseMFTDataRuns() {
 		ctrlByte, _ = dataRunReader.ReadByte()
 
 	}
-	fmt.Printf("Data Runs are: %+v\n", mft.dataRunsAll)
+
 }
 
 //MFT Method readBytes takes offset and number of bytes to read and returns slice of bytes
@@ -243,6 +324,7 @@ func (vbr *VBR) parseVBR() {
 
 //VBR Method readBytes takes offset and number of bytes to read and returns slice of bytes
 func (vbr *VBR) readBytes(offset int64, bytes int) []byte {
+
 	VBRreader := vbr.reader //convert to variable to look pretty
 
 	//Seek to offset from beginning of data
@@ -254,6 +336,7 @@ func (vbr *VBR) readBytes(offset int64, bytes int) []byte {
 
 	//Extract bytes of interest into slice hexbytes
 	hexbytes := make([]byte, bytes)
+
 	_, errHex := VBRreader.Read(hexbytes)
 	//log error
 	if errHex != nil {
